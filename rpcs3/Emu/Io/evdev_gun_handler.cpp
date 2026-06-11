@@ -13,6 +13,8 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+#include <algorithm>
+
 LOG_CHANNEL(evdev_log, "evdev");
 
 constexpr usz max_devices = 8;
@@ -133,6 +135,11 @@ int evdev_gun_handler::get_axis_y_max(u32 gunno) const
 	return axis.max - axis.min;
 }
 
+const std::string& evdev_gun_handler::get_devnode(u32 gunno) const
+{
+	return ::at32(m_devices, gunno).devnode;
+}
+
 void evdev_gun_handler::poll(u32 index)
 {
 	if (!m_is_init || index >= m_devices.size())
@@ -164,9 +171,37 @@ void evdev_gun_handler::poll(u32 index)
 			{
 			case EV_KEY:
 				gun.buttons[evt.code] = evt.value;
+				// Finger lifted: resync so the next touch doesn't jump.
+				if (gun.relative && evt.code == BTN_TOUCH && evt.value == 0)
+				{
+					gun.synced_x = false;
+					gun.synced_y = false;
+				}
 				break;
 			case EV_ABS:
-				gun.axis[evt.code].value = evt.value;
+				if (gun.relative && (evt.code == ABS_X || evt.code == ABS_Y))
+				{
+					const bool is_x = (evt.code == ABS_X);
+					int& last = is_x ? gun.last_raw_x : gun.last_raw_y;
+					bool& synced = is_x ? gun.synced_x : gun.synced_y;
+					evdev_axis& ax = gun.axis[evt.code];
+					if (synced)
+						ax.value = std::clamp(ax.value + (evt.value - last), ax.min, ax.max);
+					last = evt.value;
+					synced = true;
+				}
+				else
+				{
+					gun.axis[evt.code].value = evt.value;
+				}
+				break;
+			case EV_REL:
+				// Relative mouse: integrate the delta into the synthetic axis.
+				if (gun.relative && gun.rel_axes && (evt.code == REL_X || evt.code == REL_Y))
+				{
+					evdev_axis& ax = gun.axis[(evt.code == REL_X) ? ABS_X : ABS_Y];
+					ax.value = std::clamp(ax.value + evt.value, ax.min, ax.max);
+				}
 				break;
 			default:
 				break;
@@ -208,9 +243,18 @@ bool evdev_gun_handler::init()
 		return false;
 	}
 
-	if (udev_enumerate* enumerate = udev_enumerate_new(m_udev))
+	// Enumerate input devices matching the given udev property and add any that
+	// expose ABS_X/ABS_Y, in ascending /dev/input/eventN order.
+	const auto scan = [this](const char* id_property, bool relative)
 	{
-		udev_enumerate_add_match_property(enumerate, "ID_INPUT_MOUSE", "1");
+		udev_enumerate* enumerate = udev_enumerate_new(m_udev);
+		if (!enumerate)
+		{
+			evdev_log.error("Lightgun: Failed udev enumeration");
+			return;
+		}
+
+		udev_enumerate_add_match_property(enumerate, id_property, "1");
 		udev_enumerate_add_match_subsystem(enumerate, "input");
 		udev_enumerate_scan_devices(enumerate);
 		udev_list_entry* devs = udev_enumerate_get_list_entry(enumerate);
@@ -244,7 +288,6 @@ bool evdev_gun_handler::init()
 
 		for (const event_udev_entry& entry : sorted_devices)
 		{
-			// Get the filename of the /sys entry for the device and create a udev_device object (dev) representing it.
 			const char* name = udev_list_entry_get_name(entry.item);
 			evdev_log.notice("Lightgun: found device %s", name);
 
@@ -263,54 +306,75 @@ bool evdev_gun_handler::init()
 				continue;
 			}
 
-			if (libevdev_has_event_type(device, EV_KEY) &&
-				libevdev_has_event_type(device, EV_ABS))
-			{
-				bool is_valid = true;
+				const bool has_key = libevdev_has_event_type(device, EV_KEY);
+				const bool has_abs = libevdev_has_event_type(device, EV_ABS) &&
+					libevdev_has_event_code(device, EV_ABS, ABS_X) && libevdev_has_event_code(device, EV_ABS, ABS_Y);
+				const bool has_rel = libevdev_has_event_type(device, EV_REL) &&
+					libevdev_has_event_code(device, EV_REL, REL_X) && libevdev_has_event_code(device, EV_REL, REL_Y);
 
 				evdev_gun gun{};
 				gun.device = device;
+				gun.devnode = devnode ? devnode : "";
+				gun.relative = relative;
+				bool is_valid = false;
 
-				for (int code : { ABS_X, ABS_Y })
+				if (has_key && has_abs)
 				{
-					if (const input_absinfo* info = libevdev_get_abs_info(device, code))
+					// Absolute axes: a real lightgun, or a touchpad's finger position.
+					for (int code : { ABS_X, ABS_Y })
 					{
+						const input_absinfo* info = libevdev_get_abs_info(device, code);
 						gun.axis[code].min = info->minimum;
 						gun.axis[code].max = info->maximum;
 					}
-					else
+					if (relative) // touchpad: integrate finger-drag deltas from centre
 					{
-						evdev_log.notice("Lightgun: device %s not valid. axis %d not found", name, code);
-						is_valid = false;
-						break;
+						gun.axis[ABS_X].value = (gun.axis[ABS_X].min + gun.axis[ABS_X].max) / 2;
+						gun.axis[ABS_Y].value = (gun.axis[ABS_Y].min + gun.axis[ABS_Y].max) / 2;
 					}
+					is_valid = true;
+				}
+				else if (relative && has_key && has_rel)
+				{
+					// Relative-only pointer (a real mouse): no absolute position, so synthesize
+					// a centred virtual axis that poll() drives from REL_X/REL_Y deltas.
+					gun.rel_axes = true;
+					constexpr int range = 32767;
+					for (int code : { ABS_X, ABS_Y })
+					{
+						gun.axis[code].min = 0;
+						gun.axis[code].max = range;
+						gun.axis[code].value = range / 2;
+					}
+					is_valid = true;
 				}
 
 				if (is_valid)
 				{
-					evdev_log.notice("Lightgun: Adding device %d: %s, ABS_X(%i, %i), ABS_Y(%i, %i)", m_devices.size(), name, gun.axis[ABS_X].min, gun.axis[ABS_X].max, gun.axis[ABS_Y].min, gun.axis[ABS_Y].max);
-					m_devices.push_back(gun);
+					evdev_log.notice("Lightgun: Adding device %d: %s (%s)%s, ABS_X(%i, %i), ABS_Y(%i, %i)", m_devices.size(), name, gun.devnode, gun.rel_axes ? " [relative mouse]" : (relative ? " [relative]" : ""), gun.axis[ABS_X].min, gun.axis[ABS_X].max, gun.axis[ABS_Y].min, gun.axis[ABS_Y].max);
+					m_devices.push_back(std::move(gun));
+					if (m_devices.size() >= max_devices)
+						break;
 				}
 				else
 				{
+					evdev_log.notice("Lightgun: device %s not valid (needs ABS_X/Y, or REL_X/Y for relative)", name);
+					libevdev_free(device);
 					close(fd);
 				}
-
-				if (m_devices.size() >= max_devices)
-					break;
-			}
-			else
-			{
-				evdev_log.notice("Lightgun: device %s not valid. No axis or key events found", name);
-				close(fd);
-			}
 		}
+
 		udev_enumerate_unref(enumerate);
-	}
-	else
-	{
-		evdev_log.error("Lightgun: Failed udev enumeration");
-	}
+	};
+
+	// Prefer real lightguns (absolute, e.g. Batocera's ID_INPUT_GUN rules); then
+	// touchpads, used in *relative* mode (finger-drag like a trackball); finally
+	// mice (absolute - catches a lightgun reporting as an ABS mouse).
+	scan("ID_INPUT_GUN", false);
+	if (m_devices.empty())
+		scan("ID_INPUT_TOUCHPAD", true);
+	if (m_devices.empty())
+		scan("ID_INPUT_MOUSE", true);
 
 	m_is_init = true;
 	return true;
