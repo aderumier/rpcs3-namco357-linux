@@ -272,10 +272,10 @@ void gs_frame::handle_shortcut(gui::shortcuts::shortcut shortcut_key, const QKey
 	}
 	case gui::shortcuts::shortcut::gw_exit_fullscreen:
 	{
-		if (visibility() == FullScreen)
-		{
-			toggle_fullscreen();
-		}
+		// Arcade fork: Esc cleanly stops the game and exits the emulator
+		// (GracefulShutdown -> auto-exit). The USIO SRAM/calibration is
+		// auto-saved during play, so no data is lost.
+		close();
 		break;
 	}
 	case gui::shortcuts::shortcut::gw_log_mark:
