@@ -126,6 +126,7 @@ public:
 	// LDDs handling functions
 	bool add_ldd(std::string_view product, u16 id_vendor, u16 id_product_min, u16 id_product_max);
 	bool remove_ldd(std::string_view product);
+	bool is_ldd_registered(std::string_view product) const;
 
 	// Pipe functions
 	u32 open_pipe(u32 device_handle, u8 endpoint);
@@ -778,6 +779,7 @@ void usb_handler_thread::transfer_complete(struct libusb_transfer* transfer)
 
 bool usb_handler_thread::add_ldd(std::string_view product, u16 id_vendor, u16 id_product_min, u16 id_product_max)
 {
+	sys_usbd.notice("Adding LDD: %s (0x%04x:0x%04x-0x%04x)", std::string(product), id_vendor, id_product_min, id_product_max);
 	if (ldds.try_emplace(std::string(product), UsbLdd{id_vendor, id_product_min, id_product_max}).second)
 	{
 		for (const auto& dev : usb_devices)
@@ -787,7 +789,12 @@ bool usb_handler_thread::add_ldd(std::string_view product, u16 id_vendor, u16 id
 
 			if (dev->device._device.idVendor == id_vendor && dev->device._device.idProduct >= id_product_min && dev->device._device.idProduct <= id_product_max)
 			{
+				sys_usbd.notice("Connecting device to newly added LDD: %s (0x%04x:0x%04x)", std::string(product), dev->device._device.idVendor, dev->device._device.idProduct);
 				connect_usb_device(dev);
+			}
+			else
+			{
+				sys_usbd.notice("Skipping device for newly added LDD: %s (0x%04x:0x%04x)", std::string(product), dev->device._device.idVendor, dev->device._device.idProduct);
 			}
 		}
 
@@ -817,6 +824,11 @@ bool usb_handler_thread::remove_ldd(std::string_view product)
 	}
 
 	return false;
+}
+
+bool usb_handler_thread::is_ldd_registered(std::string_view product) const
+{
+	return ldds.contains(product);
 }
 
 u32 usb_handler_thread::open_pipe(u32 device_handle, u8 endpoint)
@@ -950,7 +962,7 @@ void usb_handler_thread::connect_usb_device(std::shared_ptr<usb_device> dev, boo
 {
 	if (update_usb_devices)
 		usb_devices.push_back(dev);
-
+	sys_usbd.notice("Connecting USB device(VID=0x%04x, PID=0x%04x)", dev->device._device.idVendor, dev->device._device.idProduct);
 	for (const auto& [name, ldd] : ldds)
 	{
 		if (dev->device._device.idVendor == ldd.id_vendor && dev->device._device.idProduct >= ldd.id_product_min && dev->device._device.idProduct <= ldd.id_product_max)
@@ -1114,6 +1126,16 @@ void handle_hotplug_event(bool connected, bool source_is_libusb)
 
 		usbh->usb_hotplug_timeout = get_system_time() + (connected ? 1'000'000ull : 0);
 	}
+}
+
+bool is_usb_ldd_registered(std::string_view product)
+{
+	if (auto usbh = g_fxo->try_get<named_thread<usb_handler_thread>>())
+	{
+		std::lock_guard lock(usbh->mutex);
+		return usbh->is_ldd_registered(product);
+	}
+	return false;
 }
 
 error_code sys_usbd_initialize(ppu_thread& ppu, vm::ptr<u32> handle)
@@ -1292,7 +1314,7 @@ error_code sys_usbd_register_ldd(ppu_thread& ppu, u32 handle, vm::cptr<char> s_p
 	{
 		{"cellUsbPspcm", {0x054C, 0x01CB, 0x01CB}},
 		{"guncon3", {0x0B9A, 0x0800, 0x0800}},
-		{"PS3A-USJ", {0x0B9A, 0x0900, 0x0910}}
+		{"PS3A-USJ", {0x0B9A, 0x0900, 0x0900}}
 	};
 
 	if (const auto iterator = predefined_ldds.find(product); iterator != predefined_ldds.end())
