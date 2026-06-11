@@ -1,0 +1,85 @@
+name: Build Linux (Docker)
+
+defaults:
+  run:
+    shell: bash
+
+on:
+  push:
+    branches:
+      - master
+      - upstream-port
+      - v0.0.41
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: build-docker-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: true
+
+env:
+  # Intentionally leave BUILD_REPOSITORY_NAME / BUILD_SOURCEBRANCHNAME unset so
+  # git-version.cmake falls back to RPCS3_GIT_FULL_BRANCH = "local_build". That
+  # makes is_local_build() true, which suppresses the upstream experimental-build
+  # warning popup and keeps the auto-updater in local mode (no self-update to the
+  # official RPCS3 releases) -- the honest identity for this arcade fork.
+  BUILD_SOURCEVERSION: ${{ github.sha }}
+  BUILD_ARTIFACTSTAGINGDIRECTORY: ${{ github.workspace }}/artifacts/
+
+jobs:
+  build:
+    name: RPCS3 Linux Docker (${{ matrix.compiler }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: [clang]
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/ccache
+      DEPLOY_APPIMAGE: true
+      APPDIR: "/rpcs3/build/appdir"
+      ARTDIR: "/root/artifacts"
+      RELEASE_MESSAGE: "/rpcs3/GitHubReleaseMessage.txt"
+      COMPILER: ${{ matrix.compiler }}
+      DOCKER_IMG: "rpcs3/rpcs3-ci-jammy:1.14"
+      RUN_UNIT_TESTS: ${{ github.event_name == 'pull_request' && 'ON' || 'OFF' }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Restore build Ccache
+        uses: actions/cache/restore@v4
+        id: restore-build-ccache
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ${{ runner.os }}-ccache-${{ matrix.compiler }}-${{ runner.arch }}-${{ github.run_id }}
+          restore-keys: ${{ runner.os }}-ccache-${{ matrix.compiler }}-${{ runner.arch }}-
+
+      - name: Docker setup and build
+        run: |
+          mkdir -p "${BUILD_ARTIFACTSTAGINGDIRECTORY}"
+          docker pull --quiet "${DOCKER_IMG}"
+          docker run \
+            -v "$PWD":/rpcs3 \
+            --env-file .ci/docker.env \
+            -v "${CCACHE_DIR}":/root/.ccache \
+            -v "${BUILD_ARTIFACTSTAGINGDIRECTORY}":"${ARTDIR}" \
+            "${DOCKER_IMG}" \
+            /rpcs3/.ci/build-linux.sh
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: RPCS3 for Linux (${{ runner.arch }}, ${{ matrix.compiler }})
+          path: ${{ env.BUILD_ARTIFACTSTAGINGDIRECTORY }}/*.AppImage
+          compression-level: 0
+          if-no-files-found: error
+
+      - name: Save build Ccache
+        if: github.ref == 'refs/heads/master'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ${{ steps.restore-build-ccache.outputs.cache-primary-key }}
