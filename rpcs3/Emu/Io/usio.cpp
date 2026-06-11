@@ -1026,7 +1026,10 @@ void usb_device_usio::usio_write(u8 channel, u16 reg, std::vector<u8>& data)
 		auto& memory = g_fxo->get<usio_memory>().backup_memory;
 		const usz addr_end = reg + data.size();
 		if (data.size() > 0 && page < usio_memory::page_count && addr_end <= usio_memory::page_size)
+		{
 			std::memcpy(&memory[usio_memory::page_size * page + reg], data.data(), data.size());
+			m_backup_dirty = true; // schedule a save (flushed from interrupt_transfer)
+		}
 		else
 			usio_log.error("Usio sram invalid write operation(page: 0x%02X, addr: 0x%04X, size: 0x%04X, data: %s)", page, reg, data.size(), fmt::buf_to_hexstring(data.data(), data.size()));
 	}
@@ -1253,6 +1256,17 @@ void usb_device_usio::interrupt_transfer(u32 buf_size, u8* buf, u32 endpoint, Us
 	transfer->expected_time = get_timestamp() + 1'000;
 
 	is_used = true;
+
+	// Persist the USIO SRAM (settings/calibration) shortly after the game writes
+	// it. Exits on Batocera/Linux usually kill the process and skip the
+	// destructor, so we can't rely on save-on-shutdown. Debounced (>=2s) so bulk
+	// writes don't hammer the disk.
+	if (m_backup_dirty && (get_timestamp() - m_backup_save_time) > 2'000'000)
+	{
+		save_backup();
+		m_backup_dirty = false;
+		m_backup_save_time = get_timestamp();
+	}
 
 	switch (endpoint)
 	{

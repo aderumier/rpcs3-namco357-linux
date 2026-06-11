@@ -66,4 +66,10 @@ private:
 	// signed delta between polls), springing back to centre (128) on release.
 	double m_wheel_pos = 128.0;
 	u64 m_wheel_time_ns = 0;
+
+	// Auto-save of the USIO SRAM (settings/calibration): the game writes it
+	// rarely, but exits on Batocera/Linux often skip the destructor, so flush it
+	// to disk shortly after a write instead of only on shutdown.
+	bool m_backup_dirty = false;
+	u64 m_backup_save_time = 0;
 };
